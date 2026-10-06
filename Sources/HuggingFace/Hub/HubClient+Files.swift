@@ -1291,7 +1291,7 @@ public extension HubClient {
             .filter { entry in
                 guard !globs.isEmpty else { return true }
                 return globs.contains { glob in
-                    hfGlobMatches(glob, entry.path)
+                    fnmatch(glob, entry.path, 0) == 0
                 }
             }
 
@@ -1548,7 +1548,7 @@ private extension HubClient {
         let requiredEntries = metadata.entries.filter { entry in
             guard !globs.isEmpty else { return true }
             return globs.contains { glob in
-                hfGlobMatches(glob, entry.path)
+                fnmatch(glob, entry.path, 0) == 0
             }
         }
 
@@ -1720,7 +1720,7 @@ private extension HubClient {
             }
             let relativePath = relativePath(from: fileURL, baseDirectory: snapshotPath)
             let hasMatch = globs.contains { glob in
-                hfGlobMatches(glob, relativePath)
+                fnmatch(glob, relativePath, 0) == 0
             }
             if hasMatch {
                 return snapshotPath
