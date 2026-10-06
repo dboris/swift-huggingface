@@ -161,7 +161,11 @@ public struct FileLock: Sendable {
         #if os(Windows)
             // `_wopen` is variadic (unavailable to Swift); `_wsopen_s` is its fixed-arity form.
             var fd: Int32 = -1
-            let status = lockPath.path(percentEncoded: false).withCString(encodedAs: UTF16.self) {
+            // The URL's file-system representation, not `path(percentEncoded:)`: the latter keeps a
+            // leading `/` before the drive letter on Windows, which the CRT rejects with EINVAL.
+            let nativePath = lockPath.withUnsafeFileSystemRepresentation { $0.map { String(cString: $0) } }
+                ?? lockPath.path(percentEncoded: false)
+            let status = nativePath.withCString(encodedAs: UTF16.self) {
                 _wsopen_s(&fd, $0, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE)
             }
             guard status == 0, fd >= 0 else {
