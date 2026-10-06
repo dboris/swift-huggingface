@@ -4,8 +4,16 @@ import Foundation
     import Darwin
 #elseif canImport(Glibc)
     import Glibc
+#elseif os(Windows)
+    // Windows (WinCatalyst fork, harmony/wincat): the lock file is opened through the CRT
+    // (`_wopen`, an `int` descriptor like the POSIX arms) and locked with
+    // `LockFileEx` / `UnlockFileEx` on its OS handle -- the `flock(2)` equivalent
+    // (exclusive, fail-immediately for the non-blocking attempt). See the
+    // `os(Windows)` helpers at the bottom of this file.
+    import CRT
+    import WinSDK
 #else
-    #error("FileLock is only supported on Darwin and Linux (Glibc) platforms.")
+    #error("FileLock is only supported on Darwin, Linux (Glibc) and Windows platforms.")
 #endif
 
 /// POSIX file permission bits,
@@ -13,7 +21,12 @@ import Foundation
 ///
 /// This is a thin wrapper around the C `mode_t` type
 /// used by `open(2)` and `fchmod(2)`.
-public typealias FilePermissions = mode_t
+#if os(Windows)
+    // The CRT has no `mode_t`; the value is accepted and unused (NTFS ACLs, not mode bits).
+    public typealias FilePermissions = Int32
+#else
+    public typealias FilePermissions = mode_t
+#endif
 
 /// A file-based lock for coordinating access to shared resources
 /// across concurrent tasks and processes.
@@ -145,19 +158,26 @@ public struct FileLock: Sendable {
             withIntermediateDirectories: true
         )
 
-        var flags: Int32 = O_RDWR | O_CREAT | O_TRUNC
-        #if !os(Windows)
-            flags |= O_NOFOLLOW
+        #if os(Windows)
+            let fd = lockPath.path(percentEncoded: false).withCString(encodedAs: UTF16.self) {
+                _wopen($0, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE)
+            }
+            guard fd >= 0 else {
+                throw FileLockError.openFailed(lockPath, errno: errno)
+            }
+            return fd
+        #else
+            var flags: Int32 = O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW
+
+            let fd = open(lockPath.path(percentEncoded: false), flags, mode)
+            guard fd >= 0 else {
+                throw FileLockError.openFailed(lockPath, errno: errno)
+            }
+
+            // Apply permissions (may silently fail if not the file owner).
+            _ = fchmod(fd, mode)
+            return fd
         #endif
-
-        let fd = open(lockPath.path(percentEncoded: false), flags, mode)
-        guard fd >= 0 else {
-            throw FileLockError.openFailed(lockPath, errno: errno)
-        }
-
-        // Apply permissions (may silently fail if not the file owner).
-        _ = fchmod(fd, mode)
-        return fd
     }
 
     /// Result of a single non-blocking `flock(2)` attempt.
@@ -171,18 +191,29 @@ public struct FileLock: Sendable {
     /// Attempts a non-blocking exclusive `flock(2)`,
     /// automatically retrying on `EINTR`.
     private func tryLock(_ fd: Int32) -> LockResult {
-        var result: Int32
-        repeat {
-            result = flock(fd, LOCK_EX | LOCK_NB)
-        } while result == -1 && errno == EINTR
+        #if os(Windows)
+            guard let handle = _hfOSHandle(fd) else { return .error(Int32(ERROR_INVALID_HANDLE)) }
+            var overlapped = OVERLAPPED()
+            if LockFileEx(handle, DWORD(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY), 0, 1, 0, &overlapped) {
+                return .success
+            }
+            let code = GetLastError()
+            if code == DWORD(ERROR_LOCK_VIOLATION) || code == DWORD(ERROR_IO_PENDING) { return .wouldBlock }
+            return .error(Int32(bitPattern: code))
+        #else
+            var result: Int32
+            repeat {
+                result = flock(fd, LOCK_EX | LOCK_NB)
+            } while result == -1 && errno == EINTR
 
-        if result == 0 { return .success }
+            if result == 0 { return .success }
 
-        switch errno {
-        case ENOSYS: return .notSupported
-        case EWOULDBLOCK, EAGAIN: return .wouldBlock
-        default: return .error(errno)
-        }
+            switch errno {
+            case ENOSYS: return .notSupported
+            case EWOULDBLOCK, EAGAIN: return .wouldBlock
+            default: return .error(errno)
+            }
+        #endif
     }
 
     /// Polls `tryLock` in a retry loop with `Task.sleep` between attempts.
@@ -228,7 +259,7 @@ public struct FileLock: Sendable {
                 }
             }
         } catch {
-            close(fd)
+            _hfCloseDescriptor(fd)
             throw error
         }
     }
@@ -241,11 +272,41 @@ public struct FileLock: Sendable {
     /// to avoid race conditions with concurrent acquirers.
     private func releaseLock(context: FileLockContext, force: Bool) async {
         if let fd = await context.releaseIfReady(force: force) {
-            flock(fd, LOCK_UN)
-            close(fd)
+            _hfUnlockDescriptor(fd)
+            _hfCloseDescriptor(fd)
         }
     }
 }
+
+// MARK: - Platform helpers (unlock / close a lock descriptor)
+
+#if os(Windows)
+    /// The OS handle behind a CRT descriptor, or nil when it is not valid.
+    private func _hfOSHandle(_ fd: Int32) -> HANDLE? {
+        let raw = _get_osfhandle(fd)
+        guard raw != -1, raw != -2, let handle = HANDLE(bitPattern: raw) else { return nil }
+        return handle
+    }
+
+    /// `UnlockFileEx` on the byte `LockFileEx` locked (the `flock(fd, LOCK_UN)` equivalent).
+    private func _hfUnlockDescriptor(_ fd: Int32) {
+        guard let handle = _hfOSHandle(fd) else { return }
+        var overlapped = OVERLAPPED()
+        _ = UnlockFileEx(handle, 0, 1, 0, &overlapped)
+    }
+
+    private func _hfCloseDescriptor(_ fd: Int32) {
+        _ = _close(fd)
+    }
+#else
+    private func _hfUnlockDescriptor(_ fd: Int32) {
+        flock(fd, LOCK_UN)
+    }
+
+    private func _hfCloseDescriptor(_ fd: Int32) {
+        close(fd)
+    }
+#endif
 
 /// Monotonically increasing counter for unique lock-owner identifiers.
 private actor OwnerIDGenerator {
@@ -305,8 +366,8 @@ private actor FileLockContext {
     /// is collected while still holding a lock.
     deinit {
         if let fd = fileDescriptor {
-            flock(fd, LOCK_UN)
-            close(fd)
+            _hfUnlockDescriptor(fd)
+            _hfCloseDescriptor(fd)
         }
     }
 
