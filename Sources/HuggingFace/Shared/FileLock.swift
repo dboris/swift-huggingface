@@ -159,11 +159,13 @@ public struct FileLock: Sendable {
         )
 
         #if os(Windows)
-            let fd = lockPath.path(percentEncoded: false).withCString(encodedAs: UTF16.self) {
-                _wopen($0, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE)
+            // `_wopen` is variadic (unavailable to Swift); `_wsopen_s` is its fixed-arity form.
+            var fd: Int32 = -1
+            let status = lockPath.path(percentEncoded: false).withCString(encodedAs: UTF16.self) {
+                _wsopen_s(&fd, $0, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE)
             }
-            guard fd >= 0 else {
-                throw FileLockError.openFailed(lockPath, errno: errno)
+            guard status == 0, fd >= 0 else {
+                throw FileLockError.openFailed(lockPath, errno: status != 0 ? status : errno)
             }
             return fd
         #else
