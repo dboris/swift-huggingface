@@ -4,6 +4,11 @@ import Foundation
     import Darwin
 #elseif canImport(Glibc)
     import Glibc
+#elseif canImport(Android)
+    // Android (WinCatalyst fork, harmony/wincat): Bionic, through Swift's `Android` module -- the POSIX
+    // arm below as written (`open(2)` with a mode through the module's Swift wrapper -- Bionic's `open`
+    // is variadic, unavailable to Swift directly -- `flock(2)`, `O_NOFOLLOW`, `mode_t`).
+    import Android
 #elseif os(Windows)
     // Windows (WinCatalyst fork, harmony/wincat): the lock file is opened through the CRT
     // (`_wopen`, an `int` descriptor like the POSIX arms) and locked with
@@ -13,7 +18,7 @@ import Foundation
     import CRT
     import WinSDK
 #else
-    #error("FileLock is only supported on Darwin, Linux (Glibc) and Windows platforms.")
+    #error("FileLock is only supported on Darwin, Linux (Glibc), Android and Windows platforms.")
 #endif
 
 /// POSIX file permission bits,
